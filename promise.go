@@ -560,3 +560,19 @@ func Sleep(d time.Duration) *Promise[struct{}] {
 		resolve(struct{}{})
 	})
 }
+
+// 强制获取值，如果有错误则抛出 panic
+func MustGet[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// 强制获取两个值，如果有错误则抛出 panic
+func MustGet2[T1, T2 any](v1 T1, v2 T2, err error) (T1, T2) {
+	if err != nil {
+		panic(err)
+	}
+	return v1, v2
+}

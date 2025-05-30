@@ -325,3 +325,26 @@ func TestAllSettled(t *testing.T) {
 
 	Block()
 }
+
+func TestMustGet(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Expected panic when calling MustGet on an error Result, but did not panic")
+		}
+	}()
+
+	MustGet(1, errors.New("test error"))
+}
+
+func TestMustGet2(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Expected panic when calling MustGet2 on an error Result, but did not panic")
+		}
+	}()
+
+	MustGet2(1, 2, errors.New("test error"))
+}

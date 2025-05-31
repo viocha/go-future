@@ -1,4 +1,4 @@
-package promise
+package future
 
 import (
 	"context"
@@ -7,48 +7,36 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viocha/go-promise/common"
+	"github.com/viocha/go-future/common"
 )
 
-type promiseState int
+type State int
 
 const (
-	Pending promiseState = iota
+	Pending State = iota
 	Fulfilled
 	Rejected
 )
 
 var (
-	ErrNoResolveOrRejectCalled = fmt.Errorf("executor did not resolve or reject")
-	ErrPanic                   = fmt.Errorf("panic occurred")
-	ErrAllFailed               = fmt.Errorf("all promises failed")
-	ErrTimeout                 = fmt.Errorf("promise timed out")
-	ErrRetryFailed             = fmt.Errorf("retry failed, max attempts reached")
+	ErrUnexpectedPanic = fmt.Errorf("unexpected panic occurred")
+	ErrAllFailed       = fmt.Errorf("all promises failed")
+	ErrTimeout         = fmt.Errorf("promise timed out")
+	ErrRetryFailed     = fmt.Errorf("retry failed, max attempts reached")
 )
 
-var wg sync.WaitGroup // 全局 WaitGroup，用于跟踪所有 Promise 的完成状态
-
-// 阻塞直到所有创建的Promise完成
-func Block() {
-	wg.Wait()
-}
-
-// 返回一个通道，等待此时的所有 Promise 完成时关闭
-func Done() chan struct{} {
-	return common.GetWgChan(&wg)
-}
-
-type Promise[T any] struct {
-	lock  sync.RWMutex
-	state promiseState
+type Future[T any] struct {
+	lock  sync.Mutex
+	state State
 	value T
 	err   error
 	done  chan struct{}
 }
 
 type Executor[T any] func(resolve func(T), reject func(error))
+type ExecutorWithContext[T any] func(ctx context.Context, resolve func(T), reject func(error))
 
-func getFns[T any](p *Promise[T], executor Executor[T]) (func(T), func(error), func()) {
+func getResolvers[T any](p *Future[T]) (func(T), func(error)) {
 	resolve := func(v T) {
 		p.lock.Lock()
 		defer p.lock.Unlock()
@@ -59,7 +47,6 @@ func getFns[T any](p *Promise[T], executor Executor[T]) (func(T), func(error), f
 		p.value = v
 		close(p.done)
 	}
-
 	reject := func(err error) {
 		p.lock.Lock()
 		defer p.lock.Unlock()
@@ -70,198 +57,146 @@ func getFns[T any](p *Promise[T], executor Executor[T]) (func(T), func(error), f
 		p.err = err
 		close(p.done)
 	}
+	return resolve, reject
+}
+
+func getExecutorDeferFn[T any](p *Future[T], reject func(error)) func() {
+	return func() {
+		if r := recover(); r != nil {
+			if p.state == Pending {
+				reject(common.WrapSub(common.ToError(r), ErrUnexpectedPanic, "panic in executor"))
+			}
+		}
+	}
+}
+
+func getFns[T any](p *Future[T], executor Executor[T]) (func(T), func(error), func()) {
+	// 只有在 resolve/reject中会修改state，而其他地方的读取操作必然会调用Await，故其他地方不需要加锁，
+	resolve, reject := getResolvers(p)
 
 	exec := func() {
-		defer func() {
-			if r := recover(); r != nil && p.state == Pending {
-				reject(common.WrapMsg(ErrPanic, "panic in executor: %v", toError(r)))
-			}
-			if p.state == Pending {
-				reject(ErrNoResolveOrRejectCalled)
-			}
-		}()
+		defer getExecutorDeferFn(p, reject)()
 		executor(resolve, reject)
 	}
 
 	return resolve, reject, exec
 }
 
-func New[T any](executor Executor[T]) *Promise[T] {
-	p := &Promise[T]{
-		state: Pending,
-		done:  make(chan struct{}),
-	}
+func getFnsWithContext[T any](ctx context.Context, p *Future[T], executor ExecutorWithContext[T]) (func(T), func(error),
+	func()) {
+	resolve, reject := getResolvers(p)
 
-	wg.Add(1) // 每创建一个 Promise，就增加 WaitGroup 的计数
-	go func() {
-		<-p.done
-		wg.Done() // 当 Promise 完成时，减少 WaitGroup 的计数
-	}()
-
-	_, _, exec := getFns(p, executor)
-	go exec()
-	return p
-}
-
-func NewWithContext[T any](ctx context.Context, executor func(resolve func(T), reject func(error))) *Promise[T] {
-	p := &Promise[T]{
-		state: Pending,
-		done:  make(chan struct{}),
-	}
-
-	wg.Add(1)
-	go func() {
-		select {
-		case <-p.done:
-			// 正常完成
-		case <-ctx.Done():
-			// 被取消
-			p.lock.Lock()
-			if p.state == Pending {
-				p.state = Rejected
-				p.err = ctx.Err() // context.Canceled 或 context.DeadlineExceeded
-				close(p.done)
+	exec := func() {
+		defer getExecutorDeferFn(p, reject)()
+		go func() { // 防止executor不监听ctx.Done()并正确reject
+			select {
+			case <-ctx.Done():
+				reject(ctx.Err()) // 如果上下文结束，返回错误
+			case <-p.done:
+				return // 如果 Future 已经完成，则不再执行
 			}
-			p.lock.Unlock()
-		}
-		wg.Done()
-	}()
+		}()
+		executor(ctx, resolve, reject)
+	}
+	return resolve, reject, exec
+}
 
+func New[T any](executor Executor[T]) *Future[T] {
+	p := &Future[T]{
+		state: Pending,
+		done:  make(chan struct{}),
+	}
 	_, _, exec := getFns(p, executor)
 	go exec()
 	return p
 }
 
-func WithResolvers[T any]() (*Promise[T], func(T), func(error)) {
-	p := &Promise[T]{
+func NewWithContext[T any](ctx context.Context, executor ExecutorWithContext[T]) *Future[T] {
+	p := &Future[T]{
 		state: Pending,
 		done:  make(chan struct{}),
 	}
+	_, _, exec := getFnsWithContext(ctx, p, executor)
+	go exec()
+	return p
+}
 
-	wg.Add(1) // 每创建一个 Promise，就增加 WaitGroup 的计数
-	go func() {
-		<-p.done
-		wg.Done() // 当 Promise 完成时，减少 WaitGroup 的计数
-	}()
+func FromFunc[T any](f func() T) *Future[T] {
+	return New(func(resolve func(T), reject func(error)) {
+		if err := common.DoSafe(func() {
+			resolve(f())
+		}); err != nil {
+			reject(err)
+		}
+	})
+}
+
+func FromFuncWithContext[T any](ctx context.Context, f func(ctx context.Context) T) *Future[T] {
+	return NewWithContext(ctx, func(ctx context.Context, resolve func(T), reject func(error)) {
+		if err := common.DoSafe(func() {
+			resolve(f(ctx))
+		}); err != nil {
+			reject(err)
+		}
+	})
+}
+
+func NewResolvers[T any]() (*Future[T], func(T), func(error)) {
+	p := &Future[T]{
+		state: Pending,
+		done:  make(chan struct{}),
+	}
 
 	resolve, reject, _ := getFns(p, nil)
 	return p, resolve, reject
 }
 
-func FromFunc[T any](f func() T) *Promise[T] {
-	return New(func(resolve func(T), reject func(error)) {
-		var result T
-		didPanic := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					reject(toError(r)) // 只能通过panic传递错误
-					didPanic = true
-				}
-			}()
-			result = f()
-		}()
-
-		if !didPanic {
-			resolve(result)
-		}
+// 快速创建已解决的Future
+func Resolve[T any](value T) *Future[T] {
+	return New(func(resolve func(T), _ func(error)) {
+		resolve(value)
 	})
 }
 
-// 如果传入的值是 error 类型，则直接返回该 error，否则将其包装为 error 类型
-func toError(r any) error {
-	if err, ok := r.(error); ok {
-		return err
+// 快速创建已拒绝的Future
+func Reject[T any](err error) *Future[T] {
+	return New(func(_ func(T), reject func(error)) {
+		reject(err)
+	})
+}
+
+// 当err为nil时，创建一个已解决的Future，否则创建一个已拒绝的Future
+func From[T any](val T, err error) *Future[T] {
+	if err != nil {
+		return Reject[T](err)
 	}
-	return fmt.Errorf("%v", r)
+	return Resolve(val)
 }
 
-func (p *Promise[T]) Try(f func(v T)) *Promise[T] {
-	return New(func(resolve func(T), reject func(error)) {
-		val, err := p.Await()
+// ======================================== 查询 ========================================
 
-		if err != nil {
-			reject(err)
-			return
-		}
+// 获取当前 Future 的状态
+func (p *Future[T]) State() State      { return p.state }
+func (p *Future[T]) IsPending() bool   { return p.state == Pending }
+func (p *Future[T]) IsFulfilled() bool { return p.state == Fulfilled }
+func (p *Future[T]) IsRejected() bool  { return p.state == Rejected }
+func (p *Future[T]) IsDone() bool      { return p.state != Pending }
 
-		didPanic := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					reject(common.WrapMsg(ErrPanic, "panic in Try: %v", toError(r)))
-					didPanic = true
-				}
-			}()
-			f(val)
-		}()
+// 获取结束的chan
+func (p *Future[T]) Done() <-chan struct{} { return p.done }
 
-		if !didPanic {
-			resolve(val)
-		}
-	})
-}
-
-func (p *Promise[T]) Catch(f func(err error)) *Promise[T] {
-	return New(func(resolve func(T), reject func(error)) {
-		val, err := p.Await()
-
-		if err == nil {
-			resolve(val)
-			return
-		}
-
-		didPanic := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					reject(common.WrapMsg(ErrPanic, "panic in Catch: %v", toError(r)))
-					didPanic = true
-				}
-			}()
-			f(err)
-		}()
-		if !didPanic {
-			reject(err)
-		}
-	})
-}
-
-func (p *Promise[T]) Finally(f func()) *Promise[T] {
-	return New(func(resolve func(T), reject func(error)) {
-		val, err := p.Await()
-
-		didPanic := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					reject(common.WrapMsg(ErrPanic, "panic in Finally: %v", toError(r)))
-					didPanic = true
-				}
-			}()
-			f()
-		}()
-
-		if didPanic {
-			return
-		}
-		if err == nil {
-			resolve(val)
-		} else {
-			reject(err)
-		}
-	})
-}
-
-// 阻塞直到 Promise 完成，并返回结果和错误
-func (p *Promise[T]) Await() (T, error) {
+// 阻塞直到 Future 完成，并返回结果和错误
+func (p *Future[T]) Await() (T, error) {
 	<-p.done
-	p.lock.RLock()
-	defer p.lock.RUnlock()
 	return p.value, p.err
 }
 
-func (p *Promise[T]) MustResolve() T {
+// 阻塞直到 Future 完成，不返回结果和错误
+func (p *Future[T]) Block() {
+	<-p.done
+}
+
+func (p *Future[T]) MustResolve() T {
 	val, err := p.Await()
 	if err != nil {
 		panic(err)
@@ -269,7 +204,7 @@ func (p *Promise[T]) MustResolve() T {
 	return val
 }
 
-func (p *Promise[T]) MustReject() error {
+func (p *Future[T]) MustReject() error {
 	_, err := p.Await()
 	if err == nil {
 		panic("expected promise to be rejected, but it was resolved")
@@ -277,43 +212,133 @@ func (p *Promise[T]) MustReject() error {
 	return err
 }
 
-func (p *Promise[T]) MapT(f func(v T) T) *Promise[T]                 { return Map(p, f) }
-func (p *Promise[T]) MapInt(f func(v T) int) *Promise[int]           { return Map(p, f) }
-func (p *Promise[T]) MapFloat(f func(v T) float64) *Promise[float64] { return Map(p, f) }
-func (p *Promise[T]) MapString(f func(v T) string) *Promise[string]  { return Map(p, f) }
-func (p *Promise[T]) MapBool(f func(v T) bool) *Promise[bool]        { return Map(p, f) }
+// ======================================== 试探并执行 ========================================
 
-// 执行新的Promise
-func (p *Promise[T]) ThenT(next func(T) *Promise[T]) *Promise[T]       { return Then(p, next) }
-func (p *Promise[T]) ThenInt(next func(T) *Promise[int]) *Promise[int] { return Then(p, next) }
-func (p *Promise[T]) ThenFloat(next func(T) *Promise[float64]) *Promise[float64] {
-	return Then(p, next)
+// 尝试获取值，如果结束且成功则返回值，否则返回默认值
+func (p *Future[T]) GetOr(defaultValue T) T {
+	if p.IsFulfilled() {
+		return p.MustResolve()
+	}
+	return defaultValue
 }
-func (p *Promise[T]) ThenString(next func(T) *Promise[string]) *Promise[string] { return Then(p, next) }
-func (p *Promise[T]) ThenBool(next func(T) *Promise[bool]) *Promise[bool]       { return Then(p, next) }
 
-// 失败时执行新的Promise
-func (p *Promise[T]) Else(next func(error) *Promise[T]) *Promise[T] {
+func (p *Future[T]) GetOrFunc(f func() T) T {
+	if p.IsFulfilled() {
+		return p.MustResolve()
+	}
+	return f()
+}
+
+// ======================================== 链式方法 ========================================
+
+// 当 Future 成功时，异步执行f，并返回一个新的 Future
+func (p *Future[T]) Try(f func(v T)) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		val, err := p.Await()
-
-		if err == nil {
-			resolve(val)
+		if err != nil {
+			reject(err)
 			return
 		}
 
-		newPromise := next(err)
-		result, err := newPromise.Await()
-		if err == nil {
-			resolve(result)
+		if fErr := common.DoSafe(func() {
+			f(val)
+		}); fErr != nil {
+			reject(fErr)
 		} else {
-			reject(err)
+			resolve(val)
 		}
 	})
 }
 
-// 设置超时，如果Promise在指定时间内未完成，则返回错误
-func (p *Promise[T]) WithTimeout(d time.Duration) *Promise[T] {
+// 当 Future 失败时，异步执行 f，并返回一个新的 Future
+func (p *Future[T]) Catch(f func(err error)) *Future[T] {
+	return New(func(resolve func(T), reject func(error)) {
+		val, err := p.Await()
+		if err == nil {
+			resolve(val) // 如果没有错误，直接返回原值
+			return
+		}
+
+		if fErr := common.DoSafe(func() {
+			f(err)
+		}); fErr != nil {
+			reject(fErr) // 如果处理错误时发生错误，返回新的错误
+		} else {
+			reject(err) // 否则，返回原始错误
+		}
+	})
+}
+
+// 当 Future 完成时，无论成功或失败，异步执行 f，并返回一个新的 Future
+func (p *Future[T]) Finally(f func()) *Future[T] {
+	return New(func(resolve func(T), reject func(error)) {
+		_, _ = p.Await() // 等待 Future 完成
+		if fErr := common.DoSafe(f); fErr != nil {
+			reject(fErr)
+		} else {
+			p.Forward(resolve, reject)
+		}
+	})
+}
+
+// 同步等待当前Future被解决，然后将p的状态转发到新的 Future
+func (p *Future[T]) Forward(resolve func(T), reject func(error)) {
+	val, err := p.Await()
+	if err == nil {
+		resolve(val)
+	} else {
+		reject(err)
+	}
+}
+
+// 成功时，将值进行转换
+func (p *Future[T]) MapT(f func(v T) T) *Future[T]                 { return Map(p, f) }
+func (p *Future[T]) MapInt(f func(v T) int) *Future[int]           { return Map(p, f) }
+func (p *Future[T]) MapFloat(f func(v T) float64) *Future[float64] { return Map(p, f) }
+func (p *Future[T]) MapStr(f func(v T) string) *Future[string]     { return Map(p, f) }
+func (p *Future[T]) MapBool(f func(v T) bool) *Future[bool]        { return Map(p, f) }
+
+// 成功时，执行新的Future
+func (p *Future[T]) ThenT(f func(T) *Future[T]) *Future[T]                 { return Then(p, f) }
+func (p *Future[T]) ThenInt(f func(T) *Future[int]) *Future[int]           { return Then(p, f) }
+func (p *Future[T]) ThenFloat(f func(T) *Future[float64]) *Future[float64] { return Then(p, f) }
+func (p *Future[T]) ThenStr(f func(T) *Future[string]) *Future[string]     { return Then(p, f) }
+func (p *Future[T]) ThenBool(f func(T) *Future[bool]) *Future[bool]        { return Then(p, f) }
+
+// 失败时，执行新的Future
+func (p *Future[T]) Else(f func(error) *Future[T]) *Future[T] {
+	return New(func(resolve func(T), reject func(error)) {
+		val, err := p.Await()
+		if err == nil {
+			resolve(val) // 如果没有错误，直接返回原值
+			return
+		}
+
+		f(err).Forward(resolve, reject) // 转发新的 Future 的结果
+	})
+}
+
+// 失败时，将错误转换为值
+func (p *Future[T]) ElseMap(f func(error) T) *Future[T] {
+	return New(func(resolve func(T), reject func(error)) {
+		val, err := p.Await()
+		if err == nil {
+			resolve(val) // 如果没有错误，直接返回原值
+			return
+		}
+
+		if fErr := common.DoSafe(func() {
+			resolve(f(err)) // 使用 f 转换错误为值
+		}); fErr != nil {
+			reject(fErr) // 如果转换过程中发生错误，返回新的错误
+		}
+	})
+}
+
+// ========================================= 添加超时和context ========================================
+
+// 设置超时，如果Future在指定时间内未完成，则返回错误。注意：不会影响executor的执行。
+func (p *Future[T]) WithTimeout(d time.Duration) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		timeout := time.After(d)
 		select {
@@ -330,14 +355,32 @@ func (p *Promise[T]) WithTimeout(d time.Duration) *Promise[T] {
 	})
 }
 
-// ======================================== 静态方法 ========================================
+// 使用上下文来控制Future的取消。注意：不会影响executor的执行。
+// 如果要支持取消executor，应该使用 NewWithContext
+func (p *Future[T]) WithContext(ctx context.Context) *Future[T] {
+	return New(func(resolve func(T), reject func(error)) {
+		select {
+		case <-ctx.Done():
+			reject(ctx.Err()) // 如果上下文结束，返回错误
+		case <-p.done:
+			val, err := p.Await()
+			if err == nil {
+				resolve(val)
+			} else {
+				reject(err)
+			}
+		}
+	})
+}
 
-// 等待所有Promise成功，任一失败立即返回错误
-func All[T any](promises ...*Promise[T]) *Promise[[]T] {
+// ======================================== 并发执行的函数 ========================================
+
+// 等待所有Future成功，任一失败立即返回错误
+func All[T any](promises ...*Future[T]) *Future[[]T] {
 	return New(func(resolve func([]T), reject func(error)) {
 		results := make([]T, len(promises))
 		var wg sync.WaitGroup
-		wg.Add(len(promises)) // 等待所有Promise完成
+		wg.Add(len(promises)) // 等待所有Future完成
 		done := common.GetWgChan(&wg)
 
 		var once sync.Once           // 确保只接收一次错误
@@ -345,7 +388,7 @@ func All[T any](promises ...*Promise[T]) *Promise[[]T] {
 
 		for i, p := range promises { // 使用索引访问，确保并发安全
 			go func() {
-				defer wg.Done() // 每个Promise完成时减少计数
+				defer wg.Done() // 每个Future完成时减少计数
 				val, err := p.Await()
 				if err == nil {
 					results[i] = val // 成功时保存结果
@@ -368,7 +411,7 @@ func All[T any](promises ...*Promise[T]) *Promise[[]T] {
 }
 
 // 任意一个成功即返回，全部失败返回聚合错误
-func Any[T any](promises ...*Promise[T]) *Promise[T] {
+func Any[T any](promises ...*Future[T]) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		var wg sync.WaitGroup
 		wg.Add(len(promises))
@@ -397,7 +440,7 @@ func Any[T any](promises ...*Promise[T]) *Promise[T] {
 		case result := <-resultCh:
 			resolve(result) // 成功时返回结果
 		case <-done:
-			reject(common.WrapSub(ErrAllFailed, errors.Join(errs...), "all promises failed in Any"))
+			reject(common.WrapSub(errors.Join(errs...), ErrAllFailed, "all promises failed in Any"))
 		}
 	})
 }
@@ -407,28 +450,28 @@ type Result[T any] struct {
 	Err error
 }
 
-func AllSettled[T any](promises ...*Promise[T]) *Promise[[]Result[T]] {
+func AllSettled[T any](promises ...*Future[T]) *Future[[]Result[T]] {
 	return New(func(resolve func([]Result[T]), reject func(error)) {
 		results := make([]Result[T], len(promises))
 		var wg sync.WaitGroup
-		wg.Add(len(promises)) // 等待所有Promise完成
+		wg.Add(len(promises)) // 等待所有Future完成
 		done := common.GetWgChan(&wg)
 
 		for i, p := range promises {
 			go func() {
-				defer wg.Done() // 每个Promise完成时减少计数
+				defer wg.Done() // 每个Future完成时减少计数
 				val, err := p.Await()
 				results[i] = Result[T]{Val: val, Err: err}
 			}()
 		}
 
-		<-done           // 等待所有Promise完成
+		<-done           // 等待所有Future完成
 		resolve(results) // 返回所有结果
 	})
 }
 
-// 获取第一个完成的Promise结果（可能成功/失败）
-func Race[T any](promises ...*Promise[T]) *Promise[T] {
+// 获取第一个完成的Future结果（可能成功/失败）
+func Race[T any](promises ...*Future[T]) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		once := sync.Once{}
 		done := make(chan struct{})
@@ -451,34 +494,22 @@ func Race[T any](promises ...*Promise[T]) *Promise[T] {
 	})
 }
 
-// 快速创建已解决的Promise
-func Resolve[T any](value T) *Promise[T] {
-	return New(func(resolve func(T), _ func(error)) {
-		resolve(value)
-	})
-}
-
-// 快速创建已拒绝的Promise
-func Reject[T any](err error) *Promise[T] {
-	return New(func(_ func(T), reject func(error)) {
-		reject(err)
-	})
-}
-
 type RetryOptions struct {
-	MaxAttempts int                             // 最大重试次数，默认3次，-1表示无限重试
-	Delay       time.Duration                   // 固定的重试间隔时间，默认100毫秒
-	DelayFn     func(attempt int) time.Duration // 可选的自定义延迟函数，attempt从1开始
+	Attempts int                             // 最大重试次数，默认3次，-1表示无限重试
+	Delay    time.Duration                   // 固定的重试间隔时间，默认100毫秒
+	DelayFn  func(attempt int) time.Duration // 可选的自定义延迟函数，attempt从1开始
 }
 
-// 重试执行任务，直到成功或达到最大重试次数
-func Retry[T any](task func() *Promise[T], retryOptions ...RetryOptions) *Promise[T] {
+// =================================== 重试执行任务 ========================================
+
+// 重试执行任务，直到成功或达到最大重试次数，retryOptions为可选参数，默认最大重试次数为3次，延迟1000毫秒
+func Retry[T any](task func() *Future[T], retryOptions ...RetryOptions) *Future[T] {
 	options := common.ParseOptional(retryOptions, RetryOptions{})
 	if options.Delay == 0 {
-		options.Delay = 100 * time.Millisecond // 默认延迟100毫秒
+		options.Delay = 1000 * time.Millisecond
 	}
-	if options.MaxAttempts == 0 {
-		options.MaxAttempts = 3 // 默认最大重试次数为3
+	if options.Attempts == 0 {
+		options.Attempts = 3
 	}
 	return New(func(resolve func(T), reject func(error)) {
 		attempt := 0
@@ -491,8 +522,8 @@ func Retry[T any](task func() *Promise[T], retryOptions ...RetryOptions) *Promis
 			}
 
 			attempt++
-			if options.MaxAttempts >= 0 && attempt >= options.MaxAttempts {
-				reject(common.WrapSub(ErrRetryFailed, err, "max retry attempts (%d) reached", options.MaxAttempts))
+			if options.Attempts >= 0 && attempt >= options.Attempts {
+				reject(common.WrapSub(err, ErrRetryFailed, "max retry attempts (%d) reached", options.Attempts))
 				return
 			}
 
@@ -507,7 +538,7 @@ func Retry[T any](task func() *Promise[T], retryOptions ...RetryOptions) *Promis
 
 // =========================================== 转换函数 ========================================
 
-func Map[T, R any](p *Promise[T], f func(v T) R) *Promise[R] {
+func Map[T, R any](p *Future[T], f func(v T) R) *Future[R] {
 	return New(func(resolve func(R), reject func(error)) {
 		val, err := p.Await()
 
@@ -516,24 +547,15 @@ func Map[T, R any](p *Promise[T], f func(v T) R) *Promise[R] {
 			return
 		}
 
-		var result R
-		didPanic := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					reject(common.WrapMsg(ErrPanic, "panic in Map: %v", toError(r)))
-					didPanic = true
-				}
-			}()
-			result = f(val)
-		}()
-		if !didPanic {
-			resolve(result)
+		if fErr := common.DoSafe(func() {
+			resolve(f(val))
+		}); fErr != nil {
+			reject(fErr)
 		}
 	})
 }
 
-func Then[T, R any](p *Promise[T], next func(T) *Promise[R]) *Promise[R] {
+func Then[T, R any](p *Future[T], next func(T) *Future[R]) *Future[R] {
 	return New(func(resolve func(R), reject func(error)) {
 		val, err := p.Await()
 		if err != nil {
@@ -541,20 +563,14 @@ func Then[T, R any](p *Promise[T], next func(T) *Promise[R]) *Promise[R] {
 			return
 		}
 
-		newPromise := next(val)
-		result, err := newPromise.Await()
-		if err == nil {
-			resolve(result)
-		} else {
-			reject(err)
-		}
+		next(val).Forward(resolve, reject)
 	})
 }
 
 // =========================================== 工具函数 ========================================
 
-// 创建延迟Promise
-func Sleep(d time.Duration) *Promise[struct{}] {
+// 创建延迟Future
+func Sleep(d time.Duration) *Future[struct{}] {
 	return New(func(resolve func(struct{}), _ func(error)) {
 		time.Sleep(d)
 		resolve(struct{}{})

@@ -1,4 +1,4 @@
-package promise
+package future
 
 import (
 	"context"
@@ -27,10 +27,8 @@ func TestPromise(t *testing.T) {
 	}).Catch(func(err error) {
 		fmt.Println("Rejected with error:", err) // 如果失败，输出错误信息
 	}).Finally(func() {
-		fmt.Println("Promise completed") // 无论成功或失败都会执行
-	})
-
-	<-Done()
+		fmt.Println("Future completed") // 无论成功或失败都会执行
+	}).Block()
 }
 
 func TestNewWithContext(t *testing.T) {
@@ -43,7 +41,7 @@ func TestNewWithContext(t *testing.T) {
 		cancel()                          // 取消上下文
 	}()
 
-	NewWithContext(ctx, func(resolve func(int), reject func(error)) {
+	NewWithContext(ctx, func(ctx context.Context, resolve func(int), reject func(error)) {
 		time.Sleep(200 * time.Millisecond)
 		resolve(2) // 成功
 	}).MapT(func(v int) int {
@@ -52,9 +50,7 @@ func TestNewWithContext(t *testing.T) {
 		fmt.Println("Resolved with value:", v) // 如果成功，输出4
 	}).Catch(func(err error) {
 		fmt.Println("Rejected with error:", err) // 如果失败，输出错误信息
-	})
-
-	<-Done() // 等待所有异步操作完成
+	}).Block()
 }
 
 func TestResolve(t *testing.T) {
@@ -63,8 +59,7 @@ func TestResolve(t *testing.T) {
 		fmt.Println("Resolved with value:", v) // 如果成功，输出42
 	}).Catch(func(err error) {
 		fmt.Println("Rejected with error:", err) // 如果失败，输出错误信息
-	})
-	<-Done() // 等待所有异步操作完成
+	}).Block()
 }
 
 func TestReject(t *testing.T) {
@@ -73,8 +68,7 @@ func TestReject(t *testing.T) {
 		fmt.Println("Resolved with value:", v) // 如果成功，不会执行
 	}).Catch(func(err error) {
 		fmt.Println("Rejected with error:", err) // 如果失败，输出错误信息
-	})
-	<-Done() // 等待所有异步操作完成
+	}).Block()
 }
 
 func TestPromisePanic(t *testing.T) {
@@ -93,10 +87,8 @@ func TestPromisePanic(t *testing.T) {
 	}).Catch(func(err error) {
 		fmt.Println("Rejected with error:", err) // 如果失败，输出错误信息
 	}).Finally(func() {
-		fmt.Println("Promise completed") // 无论成功或失败都会执行
-	})
-
-	Block()
+		fmt.Println("Future completed") // 无论成功或失败都会执行
+	}).Block()
 }
 
 func TestPromiseAll(t *testing.T) {
@@ -122,9 +114,7 @@ func TestPromiseAll(t *testing.T) {
 		t.Error("All should not fail:", err)
 	}).Finally(func() {
 		fmt.Println("All completed")
-	})
-
-	Block()
+	}).Block()
 }
 
 func TestPromiseAny(t *testing.T) {
@@ -153,9 +143,7 @@ func TestPromiseAny(t *testing.T) {
 		t.Log("Any failed:", err)
 	}).Finally(func() {
 		t.Log("Any completed")
-	})
-
-	Block()
+	}).Block()
 }
 
 func TestPromiseRace(t *testing.T) {
@@ -178,14 +166,12 @@ func TestPromiseRace(t *testing.T) {
 		t.Logf("Rejected with error: %v", err)
 	}).Finally(func() {
 		t.Log("Race completed")
-	})
-
-	Block()
+	}).Block()
 }
 
 func TestRetry(t *testing.T) {
 	t.Parallel() // 并行执行测试
-	Retry(func() *Promise[int] {
+	Retry(func() *Future[int] {
 		return New(func(resolve func(int), reject func(error)) {
 			if rand.Intn(3) == 0 {
 				resolve(666) // 成功
@@ -199,9 +185,7 @@ func TestRetry(t *testing.T) {
 		t.Logf("Retry failed with error: %v", err) // 如果失败，输出错误信息
 	}).Finally(func() {
 		t.Log("Retry completed") // 无论成功或失败都会执行
-	})
-
-	Block()
+	}).Block()
 }
 
 func TestSleep(t *testing.T) {
@@ -219,7 +203,7 @@ func TestThen(t *testing.T) {
 		} else {
 			reject(errors.New("reject reason")) // 失败
 		}
-	}).ThenT(func(v int) *Promise[int] {
+	}).ThenT(func(v int) *Future[int] {
 		return New(func(resolve func(int), _ func(error)) {
 			resolve(v * 2) // 将值乘以2
 		})
@@ -229,9 +213,7 @@ func TestThen(t *testing.T) {
 		t.Logf("Then failed with error: %v", err) // 如果失败，输出错误信息
 	}).Finally(func() {
 		t.Log("Then completed") // 无论成功或失败都会执行
-	})
-
-	Block()
+	}).Block()
 }
 
 func TestPromise_Else(t *testing.T) {
@@ -243,7 +225,7 @@ func TestPromise_Else(t *testing.T) {
 		} else {
 			reject(errors.New("something went wrong")) // 失败
 		}
-	}).Else(func(err error) *Promise[int] {
+	}).Else(func(err error) *Future[int] {
 		return New(func(resolve func(int), _ func(error)) {
 			t.Logf("Handling error: %v", err) // 处理错误
 			resolve(100)                      // 返回一个默认值
@@ -253,15 +235,13 @@ func TestPromise_Else(t *testing.T) {
 	}).Catch(func(err error) {
 		t.Logf("Rejected with error: %v", err) // 如果失败，输出错 误信息
 	}).Finally(func() {
-		t.Log("Promise completed") // 无论成功或失败都会执行
-	})
-
-	Block()
+		t.Log("Future completed") // 无论成功或失败都会执行
+	}).Block()
 }
 
 func TestWithResolvers(t *testing.T) {
 	t.Parallel() // 并行执行测试
-	p, resolve, reject := WithResolvers[int]()
+	p, resolve, reject := NewResolvers[int]()
 
 	go func() {
 		time.Sleep(200 * time.Millisecond)
@@ -277,8 +257,8 @@ func TestWithResolvers(t *testing.T) {
 	}).Catch(func(err error) {
 		t.Logf("Rejected with error: %v", err) // 如果失败，输出错误信息
 	}).Finally(func() {
-		t.Log("Promise completed") // 无论成功或失败都会执行
-	}).Await()
+		t.Log("Future completed") // 无论成功或失败都会执行
+	}).Block()
 }
 
 func TestWithFunc(t *testing.T) {
@@ -294,8 +274,8 @@ func TestWithFunc(t *testing.T) {
 	}).Catch(func(err error) {
 		t.Logf("Rejected with error: %v", err) // 如果失败，输出错误信息
 	}).Finally(func() {
-		t.Log("Promise completed") // 无论成功或失败都会执行
-	}).Await()
+		t.Log("Future completed") // 无论成功或失败都会执行
+	}).Block()
 }
 
 func TestAllSettled(t *testing.T) {
@@ -321,9 +301,7 @@ func TestAllSettled(t *testing.T) {
 		t.Log("AllSettled failed:", err)
 	}).Finally(func() {
 		t.Log("AllSettled completed")
-	})
-
-	Block()
+	}).Block()
 }
 
 func TestMustGet(t *testing.T) {

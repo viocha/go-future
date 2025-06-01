@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/viocha/go-future/common"
+	"github.com/viocha/go-future/internal/common"
 )
 
 type State int
@@ -19,7 +19,7 @@ const (
 )
 
 var (
-	ErrMust        = fmt.Errorf("panic occurred in Must function") // 用于标识预期的 panic，会被捕获
+	ErrMust        = fmt.Errorf("expected panic occurred") // 用于标识预期的 panic，会被捕获
 	ErrAllFailed   = fmt.Errorf("all promises failed")
 	ErrTimeout     = fmt.Errorf("promise timed out")
 	ErrRetryFailed = fmt.Errorf("retry failed, max attempts reached")

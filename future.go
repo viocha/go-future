@@ -495,14 +495,14 @@ func Race[T any](promises ...*Future[T]) *Future[T] {
 }
 
 type RetryOptions struct {
-	Attempts int                             // 最大重试次数，默认3次，-1表示无限重试
-	Delay    time.Duration                   // 固定的重试间隔时间，默认100毫秒
+	Attempts int                             // 最大重试次数
+	Delay    time.Duration                   // 固定的重试间隔时间
 	DelayFn  func(attempt int) time.Duration // 可选的自定义延迟函数，attempt从1开始
 }
 
 // =================================== 重试执行任务 ========================================
 
-// 重试执行任务，直到成功或达到最大重试次数，retryOptions为可选参数，默认最大重试次数为3次，延迟1000毫秒
+// 重试执行任务，直到成功或达到最大重试次数。retryOptions为可选参数，如果不提供，默认最大重试次数为3次，延迟1000毫秒
 func Retry[T any](task func() *Future[T], retryOptions ...RetryOptions) *Future[T] {
 	options := common.ParseOptional(retryOptions, RetryOptions{})
 	if options.Delay == 0 {

@@ -265,10 +265,11 @@ func TestWithFunc(t *testing.T) {
 	t.Parallel()
 	FromFunc(func() int {
 		time.Sleep(200 * time.Millisecond)
-		if rand.Intn(2) == 0 {
+		if rand.Intn(3) == 0 {
 			return 42 // 成功
 		}
-		panic(errors.New("something went wrong")) // 失败
+		panic(WrapMust("something went wrong")) // 失败
+		return 0                                // 不会执行到这里
 	}).Try(func(v int) {
 		t.Logf("Resolved with value: %d", v) // 如果成功，输出42
 	}).Catch(func(err error) {

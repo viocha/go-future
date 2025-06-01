@@ -19,10 +19,10 @@ const (
 )
 
 var (
-	ErrUnexpectedPanic = fmt.Errorf("unexpected panic occurred")
-	ErrAllFailed       = fmt.Errorf("all promises failed")
-	ErrTimeout         = fmt.Errorf("promise timed out")
-	ErrRetryFailed     = fmt.Errorf("retry failed, max attempts reached")
+	ErrMust        = fmt.Errorf("panic occurred in Must function") // 用于标识预期的 panic，会被捕获
+	ErrAllFailed   = fmt.Errorf("all promises failed")
+	ErrTimeout     = fmt.Errorf("promise timed out")
+	ErrRetryFailed = fmt.Errorf("retry failed, max attempts reached")
 )
 
 type Future[T any] struct {
@@ -60,12 +60,15 @@ func getResolvers[T any](p *Future[T]) (func(T), func(error)) {
 	return resolve, reject
 }
 
-func getExecutorDeferFn[T any](p *Future[T], reject func(error)) func() {
+func getExecutorDeferFn(reject func(error)) func() {
 	return func() {
 		if r := recover(); r != nil {
-			if p.state == Pending {
-				reject(common.WrapSub(common.ToError(r), ErrUnexpectedPanic, "panic in executor"))
+			if r, ok := r.(error); ok {
+				if errors.Is(r, ErrMust) { // 预期的 panic
+					reject(r)
+				}
 			}
+			panic(r) // 非预期的 panic，继续抛出
 		}
 	}
 }
@@ -75,7 +78,7 @@ func getFns[T any](p *Future[T], executor Executor[T]) (func(T), func(error), fu
 	resolve, reject := getResolvers(p)
 
 	exec := func() {
-		defer getExecutorDeferFn(p, reject)()
+		defer getExecutorDeferFn(reject)()
 		executor(resolve, reject)
 	}
 
@@ -87,7 +90,7 @@ func getFnsWithContext[T any](ctx context.Context, p *Future[T], executor Execut
 	resolve, reject := getResolvers(p)
 
 	exec := func() {
-		defer getExecutorDeferFn(p, reject)()
+		defer getExecutorDeferFn(reject)()
 		go func() { // 防止executor不监听ctx.Done()并正确reject
 			select {
 			case <-ctx.Done():
@@ -123,7 +126,7 @@ func NewWithContext[T any](ctx context.Context, executor ExecutorWithContext[T])
 
 func FromFunc[T any](f func() T) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
-		if err := common.DoSafe(func() {
+		if err := DoWithPanic(func() {
 			resolve(f())
 		}); err != nil {
 			reject(err)
@@ -133,7 +136,7 @@ func FromFunc[T any](f func() T) *Future[T] {
 
 func FromFuncWithContext[T any](ctx context.Context, f func(ctx context.Context) T) *Future[T] {
 	return NewWithContext(ctx, func(ctx context.Context, resolve func(T), reject func(error)) {
-		if err := common.DoSafe(func() {
+		if err := DoWithPanic(func() {
 			resolve(f(ctx))
 		}); err != nil {
 			reject(err)
@@ -240,7 +243,7 @@ func (p *Future[T]) Try(f func(v T)) *Future[T] {
 			return
 		}
 
-		if fErr := common.DoSafe(func() {
+		if fErr := DoWithPanic(func() {
 			f(val)
 		}); fErr != nil {
 			reject(fErr)
@@ -259,7 +262,7 @@ func (p *Future[T]) Catch(f func(err error)) *Future[T] {
 			return
 		}
 
-		if fErr := common.DoSafe(func() {
+		if fErr := DoWithPanic(func() {
 			f(err)
 		}); fErr != nil {
 			reject(fErr) // 如果处理错误时发生错误，返回新的错误
@@ -273,7 +276,7 @@ func (p *Future[T]) Catch(f func(err error)) *Future[T] {
 func (p *Future[T]) Finally(f func()) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		_, _ = p.Await() // 等待 Future 完成
-		if fErr := common.DoSafe(f); fErr != nil {
+		if fErr := DoWithPanic(f); fErr != nil {
 			reject(fErr)
 		} else {
 			p.Forward(resolve, reject)
@@ -327,7 +330,7 @@ func (p *Future[T]) ElseMap(f func(error) T) *Future[T] {
 			return
 		}
 
-		if fErr := common.DoSafe(func() {
+		if fErr := DoWithPanic(func() {
 			resolve(f(err)) // 使用 f 转换错误为值
 		}); fErr != nil {
 			reject(fErr) // 如果转换过程中发生错误，返回新的错误
@@ -547,7 +550,7 @@ func Map[T, R any](p *Future[T], f func(v T) R) *Future[R] {
 			return
 		}
 
-		if fErr := common.DoSafe(func() {
+		if fErr := DoWithPanic(func() {
 			resolve(f(val))
 		}); fErr != nil {
 			reject(fErr)
@@ -577,18 +580,28 @@ func Sleep(d time.Duration) *Future[struct{}] {
 	})
 }
 
-// 强制获取值，如果有错误则抛出 panic
+// 将一个值包装成ErrMustFnPanic错误，并返回错误
+func WrapMust(v any) error {
+	return errors.Join(ErrMust, common.ToError(v))
+}
+
+// 强制获取值，如果有错误则 panic
 func MustGet[T any](v T, err error) T {
 	if err != nil {
-		panic(err)
+		panic(common.WrapSub(err, ErrMust, "panic in MustGet"))
 	}
 	return v
 }
 
-// 强制获取两个值，如果有错误则抛出 panic
+// 强制获取两个值，如果有错误则 panic
 func MustGet2[T1, T2 any](v1 T1, v2 T2, err error) (T1, T2) {
 	if err != nil {
-		panic(err)
+		panic(common.WrapSub(err, ErrMust, "panic in MustGet2"))
 	}
 	return v1, v2
+}
+
+// 捕获 ErrMust 错误的panic
+func DoWithPanic(f func()) error {
+	return common.DoSafe(f, ErrMust)
 }

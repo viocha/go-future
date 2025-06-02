@@ -32,7 +32,7 @@ func ToError(r any) error {
 
 // 可以从panic中安全地执行函数，返回是否成功执行。
 // errs指定需要捕获的错误类型列表，默认捕获所有错误
-func DoSafe(f func(), errs ...error) error {
+func SafeDo(f func(), errs ...error) error {
 	var err error
 	deferFn := func() {
 		if r := recover(); r != nil {

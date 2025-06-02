@@ -129,7 +129,7 @@ func NewWithContext[T any](ctx context.Context, executor ExecutorWithContext[T])
 
 func FromFunc[T any](f func() T) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
-		if err := DoWithPanic(func() {
+		if err := catchMustPanic(func() {
 			resolve(f())
 		}); err != nil {
 			reject(err)
@@ -139,7 +139,7 @@ func FromFunc[T any](f func() T) *Future[T] {
 
 func FromFuncWithContext[T any](ctx context.Context, f func(ctx context.Context) T) *Future[T] {
 	return NewWithContext(ctx, func(ctx context.Context, resolve func(T), reject func(error)) {
-		if err := DoWithPanic(func() {
+		if err := catchMustPanic(func() {
 			resolve(f(ctx))
 		}); err != nil {
 			reject(err)
@@ -248,7 +248,7 @@ func (p *Future[T]) Try(f func(v T)) *Future[T] {
 			return
 		}
 
-		if fErr := DoWithPanic(func() {
+		if fErr := catchMustPanic(func() {
 			f(val)
 		}); fErr != nil {
 			reject(fErr)
@@ -267,7 +267,7 @@ func (p *Future[T]) Catch(f func(err error)) *Future[T] {
 			return
 		}
 
-		if fErr := DoWithPanic(func() {
+		if fErr := catchMustPanic(func() {
 			f(err)
 		}); fErr != nil {
 			reject(fErr) // 如果处理错误时发生错误，返回新的错误
@@ -281,7 +281,7 @@ func (p *Future[T]) Catch(f func(err error)) *Future[T] {
 func (p *Future[T]) Finally(f func()) *Future[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		_, _ = p.Await() // 等待 Future 完成
-		if fErr := DoWithPanic(f); fErr != nil {
+		if fErr := catchMustPanic(f); fErr != nil {
 			reject(fErr)
 		} else {
 			p.Forward(resolve, reject)
@@ -335,7 +335,7 @@ func (p *Future[T]) ElseMap(f func(error) T) *Future[T] {
 			return
 		}
 
-		if fErr := DoWithPanic(func() {
+		if fErr := catchMustPanic(func() {
 			resolve(f(err)) // 使用 f 转换错误为值
 		}); fErr != nil {
 			reject(fErr) // 如果转换过程中发生错误，返回新的错误
@@ -555,7 +555,7 @@ func Map[T, R any](p *Future[T], f func(v T) R) *Future[R] {
 			return
 		}
 
-		if fErr := DoWithPanic(func() {
+		if fErr := catchMustPanic(func() {
 			resolve(f(val))
 		}); fErr != nil {
 			reject(fErr)
@@ -576,6 +576,11 @@ func Then[T, R any](p *Future[T], next func(T) *Future[R]) *Future[R] {
 }
 
 // =========================================== 工具函数 ========================================
+
+// 捕获 ErrMust 错误的panic，并返回错误，其他类型则继续panic
+func catchMustPanic(f func()) error {
+	return common.SafeDo(f, ErrMust)
+}
 
 // 创建延迟Future
 func Sleep(d time.Duration) *Future[struct{}] {
@@ -606,7 +611,28 @@ func MustGet2[T1, T2 any](v1 T1, v2 T2, err error) (T1, T2) {
 	return v1, v2
 }
 
-// 捕获 ErrMust 错误的panic
-func DoWithPanic(f func()) error {
-	return common.DoSafe(f, ErrMust)
+// 捕获所有 panic，如果存在，则转换成 ErrMust 错误，然后panic
+func WrapPanic(f func()) {
+	err := common.SafeDo(f)
+	if err != nil {
+		if !errors.Is(err, ErrMust) {
+			err = WrapMust(err)
+		}
+		panic(err) // 如果发生错误，panic
+	}
+}
+
+// 捕获所有 panic，如果存在，则转换成 ErrMust 错误，然后panic。否则返回原来的结果
+func WrapPanicGet[T any](f func() T) T {
+	var result T
+	if err := common.SafeDo(func() {
+		result = f()
+	}); err != nil {
+		if !errors.Is(err, ErrMust) {
+			err = WrapMust(err)
+		}
+		panic(err) // 如果发生错误，panic
+	} else {
+		return result // 如果没有错误，返回结果
+	}
 }

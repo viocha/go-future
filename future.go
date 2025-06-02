@@ -10,6 +10,9 @@ import (
 	"github.com/viocha/go-future/internal/common"
 )
 
+// 用于只关心是否成功，不关心返回结果的异步任务
+type Task = Future[struct{}]
+
 type State int
 
 const (
@@ -199,18 +202,20 @@ func (p *Future[T]) Block() {
 	<-p.done
 }
 
+// 等待并获取结果，如果发生错误，则执行可捕获的panic
 func (p *Future[T]) MustResolve() T {
 	val, err := p.Await()
 	if err != nil {
-		panic(err)
+		panic(WrapMust(err))
 	}
 	return val
 }
 
+// 等待并获取错误，如果未发生错误，则执行可捕获的panic
 func (p *Future[T]) MustReject() error {
 	_, err := p.Await()
 	if err == nil {
-		panic("expected promise to be rejected, but it was resolved")
+		panic(WrapMust("expected promise to be rejected, but it was resolved"))
 	}
 	return err
 }

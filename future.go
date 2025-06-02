@@ -592,13 +592,20 @@ func Sleep(d time.Duration) *Future[struct{}] {
 
 // 将一个值包装成ErrMustFnPanic错误，并返回错误
 func WrapMust(v any) error {
-	return errors.Join(ErrMust, common.ToError(v))
+	err := common.ToError(v)
+	if !errors.Is(err, ErrMust) {
+		err = errors.Join(ErrMust, err)
+	}
+	return err
 }
 
 // 强制获取值，如果有错误则 panic
 func MustGet[T any](v T, err error) T {
 	if err != nil {
-		panic(common.WrapSub(err, ErrMust, "panic in MustGet"))
+		if !errors.Is(err, ErrMust) {
+			err = common.WrapSub(err, ErrMust, "panic in MustGet")
+		}
+		panic(err)
 	}
 	return v
 }
@@ -606,7 +613,10 @@ func MustGet[T any](v T, err error) T {
 // 强制获取两个值，如果有错误则 panic
 func MustGet2[T1, T2 any](v1 T1, v2 T2, err error) (T1, T2) {
 	if err != nil {
-		panic(common.WrapSub(err, ErrMust, "panic in MustGet2"))
+		if !errors.Is(err, ErrMust) {
+			err = common.WrapSub(err, ErrMust, "panic in MustGet")
+		}
+		panic(err)
 	}
 	return v1, v2
 }

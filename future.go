@@ -599,6 +599,13 @@ func WrapMust(v any) error {
 	return err
 }
 
+// 如果err不为nil，则将其包装为 ErrMust 错误并panic
+func MustNil(err error) {
+	if err != nil {
+		panic(WrapMust(err))
+	}
+}
+
 // 强制获取值，如果有错误则 panic
 func MustGet[T any](v T, err error) T {
 	if err != nil {
